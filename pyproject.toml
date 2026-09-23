@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "omnot"
+version = "0.1.0"
+description = "Omnot — роутер к AI-провайдерам с автоматическим переключением при лимитах"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+
+dependencies = [
+    "httpx>=0.25.0",
+]
+
+[project.optional-dependencies]
+server = [
+    "starlette>=0.27.0",
+    "uvicorn>=0.23.0",
+]
+dev = [
+    "pytest>=7.0",
+    "pytest-asyncio>=0.21",
+]
+
+[project.scripts]
+omnot = "omnot.cli:main"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
