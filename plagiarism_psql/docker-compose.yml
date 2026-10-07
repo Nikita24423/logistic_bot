@@ -1,0 +1,59 @@
+# Standalone ML stack (Qdrant + analysis). Models baked into the image at build time.
+
+services:
+  qdrant:
+    image: qdrant/qdrant:v1.12.5
+    container_name: antiplagiarism-qdrant
+    restart: unless-stopped
+    ports:
+      - "6333:6333"
+    volumes:
+      - qdrant_storage:/qdrant/storage
+
+  analysis:
+    image: antiplagiat-analysis:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        EMBEDDING_MODEL: "${EMBEDDING_MODEL:-BAAI/bge-m3}"
+        AI_MODEL: "${AI_MODEL:-sberbank-ai/rugpt3small_based_on_gpt2}"
+    container_name: antiplagiarism-analysis
+    restart: unless-stopped
+    depends_on:
+      - qdrant
+    environment:
+      QDRANT_HOST: qdrant
+      QDRANT_PORT: "6333"
+      QDRANT_COLLECTION: university_docs
+      DEVICE: "${DEVICE:-auto}"
+      TORCH_CPU_THREADS: "${TORCH_CPU_THREADS:-}"
+      ANALYSIS_CONCURRENCY: "${ANALYSIS_CONCURRENCY:-1}"
+      EMBEDDING_MODEL: "${EMBEDDING_MODEL:-BAAI/bge-m3}"
+      AI_MODEL: "${AI_MODEL:-sberbank-ai/rugpt3small_based_on_gpt2}"
+      QDRANT_SCORE_THRESHOLD: "${QDRANT_SCORE_THRESHOLD:-0.80}"
+      LEXICAL_SCORE_THRESHOLD: "${LEXICAL_SCORE_THRESHOLD:-0.60}"
+      PARAPHRASE_THRESHOLD: "${PARAPHRASE_THRESHOLD:-0.15}"
+      AI_DETECT_D0: "${AI_DETECT_D0:-1.0}"
+      AI_DETECT_SCALE: "${AI_DETECT_SCALE:-1.5}"
+      AI_DETECT_BATCH_SIZE: "${AI_DETECT_BATCH_SIZE:-8}"
+      ANALYSIS_API_KEY: "${ANALYSIS_API_KEY:-}"
+      CORS_ALLOW_ORIGINS: "${CORS_ALLOW_ORIGINS:-}"
+      HF_HUB_ENABLE_HF_TRANSFER: "1"
+    ports:
+      - "8765:8765"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import json,sys,urllib.request; d=json.load(urllib.request.urlopen('http://127.0.0.1:8765/health', timeout=5)); sys.exit(0 if d.get('ready') else 1)",
+        ]
+      interval: 15s
+      timeout: 10s
+      retries: 40
+      start_period: 300s
+
+volumes:
+  qdrant_storage:

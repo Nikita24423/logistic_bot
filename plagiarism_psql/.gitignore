@@ -1,0 +1,20 @@
+# Секреты модуля (локальный .env в корне)
+.env
+
+.venv/
+__pycache__/
+
+# Локальный бинарник Qdrant и его данные (запуск без Docker)
+qdrant-bin/
+*.py[cod]
+.pytest_cache/
+
+.DS_Store
+.pycache/
+
+# Соседние проекты в рабочей копии — не должны попадать в этот репозиторий
+/guard-main/
+/antiplagiarism/
+
+# Случайный пустой lock в родительской папке
+/package-lock.json
