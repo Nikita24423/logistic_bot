@@ -43,7 +43,7 @@ RUN --mount=type=cache,id=analysis-hf,target=/cache/hf \
  && cp -a /cache/st/. /opt/models/sentence-transformers/
 
 # Layer 3 — application code (changes often; cheap rebuild)
-COPY api_server.py worker.py cascade.py university_queues.py job_store.py comparison_scope.py ./
+COPY api_server.py worker.py cascade.py university_queues.py job_store.py comparison_scope.py document_sections.py ./
 
 EXPOSE 8765
 

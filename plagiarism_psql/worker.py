@@ -59,6 +59,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 # Стоп-слова и каскадная классификация заимствований — в cascade.py
 # (единственный источник истины по типам exact/paraphrase/semantic).
 from comparison_scope import comparison_categories, normalize_category_slug
+from document_sections import strip_service_sections
 from cascade import (
     DEFAULT_PARAPHRASE_THRESHOLD,
     STOPWORDS as _STOPWORDS,
@@ -125,6 +126,13 @@ class AntiPlagiarismWorker:
         # поэтому скор лежит в [0..1]: 1.0 — дословная копия чанка, ~0.8 — лёгкая
         # правка, <0.3 — несвязанные тексты. Калибруется через env.
         self.lexical_score_threshold = float(os.getenv("LEXICAL_SCORE_THRESHOLD", "0.60"))
+
+        # Отсечение служебных разделов (титульник, содержание, список источников,
+        # приложения) до нарезки на чанки. Отключается глобально через env либо
+        # для отдельного запроса параметром strip_sections.
+        self.strip_sections_default = os.getenv(
+            "STRIP_SERVICE_SECTIONS", "1"
+        ).strip().lower() not in {"0", "false", "no"}
 
         # Порог Жаккара 3-грамм смысловых слов для тира «перефраз» каскада.
         self.paraphrase_threshold = float(
@@ -412,6 +420,7 @@ class AntiPlagiarismWorker:
         institution_id: Optional[str] = None,
         user_id: Optional[str] = None,
         exclude_document_ids: Optional[List[int]] = None,
+        strip_sections: Optional[bool] = None,
     ) -> Dict:
         # Сериализуем доступ к общей ML-модели и клиенту Qdrant (см. self._process_lock).
         with self._process_lock:
@@ -424,6 +433,7 @@ class AntiPlagiarismWorker:
                 institution_id,
                 user_id,
                 exclude_document_ids,
+                strip_sections,
             )
 
     def _process_text_locked(
@@ -436,18 +446,37 @@ class AntiPlagiarismWorker:
         institution_id: Optional[str] = None,
         user_id: Optional[str] = None,
         exclude_document_ids: Optional[List[int]] = None,
+        strip_sections: Optional[bool] = None,
     ) -> Dict:
         norm_category = normalize_category_slug(category or "uncategorized")
         norm_institution = (institution_id or "").strip() or None
         norm_user_id = (user_id or "").strip() or None
         actual_text = self.extract_real_text(text)
-        chunks = self.text_splitter.split_text(actual_text)
+
+        # Служебные разделы режутся ДО нарезки на чанки: чанки не выровнены по
+        # границам разделов, один чанк захватывает конец титульника и начало
+        # содержания сразу. Дальше и поиск, и индексация работают с одним и тем
+        # же очищенным текстом — иначе в корпусе осталось бы то, что мы
+        # перестали искать.
+        do_strip = (
+            self.strip_sections_default if strip_sections is None else bool(strip_sections)
+        )
+        sections_report: Dict = {"removed_sections": [], "fallback": False}
+        analyzed_text = actual_text
+        if do_strip:
+            analyzed_text, report = strip_service_sections(actual_text)
+            sections_report = report.as_dict()
+            if verbose and report.removed:
+                print(f"Удалены служебные разделы: {', '.join(report.removed)}")
+
+        chunks = self.text_splitter.split_text(analyzed_text)
         if not chunks:
             return {
                 "plagiarism_percent": 0.0,
                 "ai_percent": 0.0,
                 "parsed_text": actual_text,
                 "semantic_matches": [],
+                "sections": sections_report,
             }
         if verbose:
             print(f"Analysis {filename[:20]}... (chunks: {len(chunks)})")
@@ -637,4 +666,5 @@ class AntiPlagiarismWorker:
             "parsed_text": actual_text,
             "semantic_matches": semantic_matches,
             "by_type": by_type,
+            "sections": sections_report,
         }

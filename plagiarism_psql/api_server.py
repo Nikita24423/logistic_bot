@@ -33,6 +33,9 @@ class AnalyzeRequest(BaseModel):
     user_id: Optional[str] = Field(default=None, max_length=128)
     # Legacy Qdrant points may lack user_id; Guard sends sibling doc ids to exclude.
     exclude_document_ids: list[int] = Field(default_factory=list)
+    # Отсечение служебных разделов (титульник, содержание, список источников,
+    # приложения) до анализа. None — взять значение из env STRIP_SERVICE_SECTIONS.
+    strip_sections: Optional[bool] = None
 
 
 class SemanticMatch(BaseModel):
@@ -51,11 +54,23 @@ class SemanticMatch(BaseModel):
     sample: str = ""
 
 
+class SectionsInfo(BaseModel):
+    """Какие служебные разделы были вырезаны до анализа.
+
+    fallback=true — разбор структуры отвергнут предохранителем (вырезание съело
+    бы почти весь текст), работа проанализирована целиком."""
+    removed_sections: list[str] = []
+    chars_before: int = 0
+    chars_after: int = 0
+    fallback: bool = False
+
+
 class AnalyzeResponse(BaseModel):
     plagiarism_percent: float
     ai_percent: float
     semantic_matches: list[SemanticMatch] = []
     by_type: dict[str, int] = {}
+    sections: SectionsInfo = SectionsInfo()
 
 
 class JobSubmitResponse(BaseModel):
@@ -97,6 +112,7 @@ def _to_analyze_response(result: dict[str, Any]) -> AnalyzeResponse:
         ai_percent=float(result.get("ai_percent", 0.0)),
         semantic_matches=[SemanticMatch(**m) for m in result.get("semantic_matches", [])],
         by_type=result.get("by_type", {}),
+        sections=SectionsInfo(**(result.get("sections") or {})),
     )
 
 
@@ -180,6 +196,7 @@ async def analyze(body: AnalyzeRequest, x_api_key: Optional[str] = Header(defaul
                 institution_id=body.university_id,
                 user_id=body.user_id,
                 exclude_document_ids=body.exclude_document_ids,
+                strip_sections=body.strip_sections,
             ),
         )
     except ValueError as exc:
@@ -205,6 +222,7 @@ async def submit_job(body: AnalyzeRequest, x_api_key: Optional[str] = Header(def
     category = body.category
     user_id = body.user_id
     exclude_document_ids = list(body.exclude_document_ids or [])
+    strip_sections = body.strip_sections
     job_id = rec.job_id
 
     def _submit():
@@ -219,6 +237,7 @@ async def submit_job(body: AnalyzeRequest, x_api_key: Optional[str] = Header(def
                 institution_id=university_id,
                 user_id=user_id,
                 exclude_document_ids=exclude_document_ids,
+                strip_sections=strip_sections,
             ),
         )
 
