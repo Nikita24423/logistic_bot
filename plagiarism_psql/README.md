@@ -14,7 +14,7 @@ Docker-образуемый модуль анализа текста: **HTTP API
 ## Быстрый запуск (Docker, Linux)
 
 ```bash
-git clone https://github.com/Andhanc/plagiarism_psql.git
+git clone https://github.com/sakura-sak/plagiarism_psql.git
 cd plagiarism_psql
 cp env.docker.example .env
 # задайте ANALYSIS_API_KEY в .env при необходимости
@@ -31,6 +31,14 @@ curl -sS http://localhost:8765/health
   - `DEVICE=cuda` — требовать GPU (если CUDA недоступна, сервис упадёт при старте)
   - `DEVICE=cpu` — принудительно CPU
 - **Отсечение служебных разделов:** `STRIP_SERVICE_SECTIONS` (`1` по умолчанию, `0` — анализировать работу целиком)
+- **Индексация проверяемых работ:** `INDEX_ANALYZED_DOCUMENTS` (`1` по умолчанию; `0` — не добавлять работу в корпус сравнения)
+- **Порог тира «дословное копирование»:** `EXACT_THRESHOLD` (`0.80`); порог лексического *поиска* — отдельный `LEXICAL_SCORE_THRESHOLD` (`0.60`)
+- **Пересоздание коллекции Qdrant:** `ALLOW_COLLECTION_RECREATE` (`0`; при `1` несовместимость схемы приводит к УДАЛЕНИЮ всех проиндексированных работ)
+- **Журнал async-джоб:** `ANALYSIS_JOB_DB` (`/app/data/jobs.db`; `:memory:` — без персистентности), TTL — `ANALYSIS_JOB_TTL_SEC`
+- **Лимиты входа:** `ANALYSIS_MAX_CONTENT_CHARS`, `ANALYSIS_MAX_FILE_BYTES`, `ANALYSIS_MAX_PDF_PAGES`, `ANALYSIS_MAX_UNCOMPRESSED_BYTES`
+
+Порт Qdrant намеренно **не публикуется** на хост: у него нет аутентификации.
+Для отладки раскомментируйте `ports` в `docker-compose.yml`, привязав к `127.0.0.1`.
 
 Для GPU в Docker на Linux требуется NVIDIA runtime (`nvidia-container-toolkit`) и запуск контейнера с доступом к GPU.
 

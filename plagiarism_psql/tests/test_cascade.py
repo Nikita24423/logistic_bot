@@ -27,6 +27,6 @@ def test_paraphrase_similarity_is_low_for_unrelated_texts():
 
 
 def test_classify_match_cascade_exact_then_paraphrase_then_semantic():
-    assert classify_match(0.9, 0.0, lexical_threshold=0.6) == EXACT
-    assert classify_match(0.2, 0.4, lexical_threshold=0.6) == PARAPHRASE
-    assert classify_match(0.1, 0.05, lexical_threshold=0.6) == SEMANTIC
+    assert classify_match(0.9, 0.0, exact_threshold=0.6) == EXACT
+    assert classify_match(0.2, 0.4, exact_threshold=0.6) == PARAPHRASE
+    assert classify_match(0.1, 0.05, exact_threshold=0.6) == SEMANTIC

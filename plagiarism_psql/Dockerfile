@@ -36,14 +36,17 @@ RUN --mount=type=cache,id=analysis-hf,target=/cache/hf \
     --mount=type=cache,id=analysis-st,target=/cache/st \
     HF_HOME=/cache/hf \
     SENTENCE_TRANSFORMERS_HOME=/cache/st \
-    TRANSFORMERS_CACHE=/cache/hf \
     python preload_models.py \
  && mkdir -p /opt/models/huggingface /opt/models/sentence-transformers \
  && cp -a /cache/hf/. /opt/models/huggingface/ \
  && cp -a /cache/st/. /opt/models/sentence-transformers/
 
 # Layer 3 — application code (changes often; cheap rebuild)
-COPY api_server.py worker.py cascade.py university_queues.py job_store.py comparison_scope.py document_sections.py ./
+COPY api_server.py worker.py cascade.py university_queues.py job_store.py \
+     comparison_scope.py document_sections.py document_text.py ./
+
+# Каталог журнала джоб (в compose сюда монтируется том analysis_jobs).
+RUN mkdir -p /app/data
 
 EXPOSE 8765
 

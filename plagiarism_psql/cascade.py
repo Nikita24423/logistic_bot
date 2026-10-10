@@ -8,8 +8,12 @@
 на случай недоступности ML.
 
 Каскад по источнику (первый сработавший тир определяет тип):
-  1. exact      — лексический косинус ≥ LEXICAL_SCORE_THRESHOLD
-                  (дословное копирование: совпали конкретные слова);
+  1. exact      — лексический косинус ≥ EXACT_THRESHOLD
+                  (дословное копирование: совпали конкретные слова).
+                  Порог отдельный от LEXICAL_SCORE_THRESHOLD, по которому
+                  ведётся лексический ПОИСК: при совпадении этих порогов тир
+                  вырождается, потому что поиск и так возвращает только хиты
+                  выше своего порога, и `exact` получал бы каждый из них;
   2. paraphrase — совпадение 3-грамм по смысловым словам (Жаккар)
                   ≥ PARAPHRASE_THRESHOLD (переформулировка с сохранением
                   смысловой лексики);
@@ -78,11 +82,14 @@ def paraphrase_similarity(text1: str, text2: str, k: int = 3) -> float:
 def classify_match(
     max_lexical_score: float,
     paraphrase_score: float,
-    lexical_threshold: float,
+    exact_threshold: float,
     paraphrase_threshold: float = DEFAULT_PARAPHRASE_THRESHOLD,
 ) -> str:
-    """Тип заимствования источника по каскаду exact → paraphrase → semantic."""
-    if max_lexical_score >= lexical_threshold:
+    """Тип заимствования источника по каскаду exact → paraphrase → semantic.
+
+    `exact_threshold` — порог тира «дословное копирование», НЕ порог лексического
+    поиска: см. модульный docstring."""
+    if max_lexical_score >= exact_threshold:
         return EXACT
     if paraphrase_score >= paraphrase_threshold:
         return PARAPHRASE

@@ -5,8 +5,14 @@ services:
     image: qdrant/qdrant:v1.12.5
     container_name: antiplagiarism-qdrant
     restart: unless-stopped
-    ports:
-      - "6333:6333"
+    # Порт НЕ публикуется на хост: у Qdrant здесь нет аутентификации, и любой
+    # с доступом к хосту мог бы прочитать или удалить весь корпус работ.
+    # Сервис analysis обращается к нему по имени во внутренней сети compose.
+    # Для локальной отладки раскомментируйте, привязав к loopback:
+    # ports:
+    #   - "127.0.0.1:6333:6333"
+    expose:
+      - "6333"
     volumes:
       - qdrant_storage:/qdrant/storage
 
@@ -21,7 +27,14 @@ services:
     container_name: antiplagiarism-analysis
     restart: unless-stopped
     depends_on:
-      - qdrant
+      # Намеренно service_started, а не service_healthy: набор утилит в образе
+      # Qdrant не гарантирован (ни curl, ни bash с /dev/tcp), и healthcheck,
+      # опирающийся на отсутствующий бинарник, навсегда оставил бы analysis
+      # незапущенным. Готовность Qdrant обеспечивается на стороне кода:
+      # _ensure_qdrant_collection ретраит 30 с, а инициализация воркера
+      # повторяется каждые ANALYSIS_WORKER_RETRY_SEC секунд.
+      qdrant:
+        condition: service_started
     environment:
       QDRANT_HOST: qdrant
       QDRANT_PORT: "6333"
@@ -35,6 +48,13 @@ services:
       LEXICAL_SCORE_THRESHOLD: "${LEXICAL_SCORE_THRESHOLD:-0.60}"
       PARAPHRASE_THRESHOLD: "${PARAPHRASE_THRESHOLD:-0.15}"
       STRIP_SERVICE_SECTIONS: "${STRIP_SERVICE_SECTIONS:-1}"
+      EXACT_THRESHOLD: "${EXACT_THRESHOLD:-0.80}"
+      INDEX_ANALYZED_DOCUMENTS: "${INDEX_ANALYZED_DOCUMENTS:-1}"
+      ALLOW_COLLECTION_RECREATE: "${ALLOW_COLLECTION_RECREATE:-0}"
+      ANALYSIS_JOB_DB: "${ANALYSIS_JOB_DB:-/app/data/jobs.db}"
+      ANALYSIS_MAX_CONTENT_CHARS: "${ANALYSIS_MAX_CONTENT_CHARS:-41943040}"
+      ANALYSIS_MAX_FILE_BYTES: "${ANALYSIS_MAX_FILE_BYTES:-26214400}"
+      ANALYSIS_MAX_PDF_PAGES: "${ANALYSIS_MAX_PDF_PAGES:-500}"
       AI_DETECT_D0: "${AI_DETECT_D0:-1.0}"
       AI_DETECT_SCALE: "${AI_DETECT_SCALE:-1.5}"
       AI_DETECT_BATCH_SIZE: "${AI_DETECT_BATCH_SIZE:-8}"
@@ -43,6 +63,10 @@ services:
       HF_HUB_ENABLE_HF_TRANSFER: "1"
     ports:
       - "8765:8765"
+    volumes:
+      # Журнал async-джоб: переживает рестарт контейнера, иначе клиент получает
+      # 404 на валидный job_id и опрашивает его до истечения TTL.
+      - analysis_jobs:/app/data
     healthcheck:
       test:
         [
@@ -58,3 +82,4 @@ services:
 
 volumes:
   qdrant_storage:
+  analysis_jobs:

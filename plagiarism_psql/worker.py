@@ -1,6 +1,5 @@
-import base64
 import hashlib
-import io
+import logging
 import math
 import os
 import re
@@ -17,6 +16,8 @@ urllib3.disable_warnings(urllib3.exceptions.NotOpenSSLWarning)
 warnings.filterwarnings("ignore")
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+logger = logging.getLogger(__name__)
 
 
 def _parse_positive_int(name: str, default: int) -> int:
@@ -46,7 +47,7 @@ from qdrant_client.models import (
     Filter,
     FilterSelector,
     MatchValue,
-    MatchAny,
+    PayloadSchemaType,
     PointStruct,
     QueryRequest,
     SparseVector,
@@ -58,8 +59,9 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 # Стоп-слова и каскадная классификация заимствований — в cascade.py
 # (единственный источник истины по типам exact/paraphrase/semantic).
-from comparison_scope import comparison_categories, normalize_category_slug
+from comparison_scope import build_comparison_filter, normalize_category_slug
 from document_sections import strip_service_sections
+from document_text import extract_document_text
 from cascade import (
     DEFAULT_PARAPHRASE_THRESHOLD,
     STOPWORDS as _STOPWORDS,
@@ -126,6 +128,38 @@ class AntiPlagiarismWorker:
         # поэтому скор лежит в [0..1]: 1.0 — дословная копия чанка, ~0.8 — лёгкая
         # правка, <0.3 — несвязанные тексты. Калибруется через env.
         self.lexical_score_threshold = float(os.getenv("LEXICAL_SCORE_THRESHOLD", "0.60"))
+
+        # Порог тира «дословное копирование» в каскаде. Раньше здесь
+        # использовался тот же LEXICAL_SCORE_THRESHOLD, что и для поиска, —
+        # и тир `exact` вырождался: лексический запрос и так возвращает только
+        # хиты выше порога поиска, поэтому КАЖДЫЙ лексический хит попадал в
+        # `exact`, а значения ниже порога не наблюдались вовсе. Теперь поиск
+        # ведётся по более низкому порогу (видим слабые лексические совпадения),
+        # а `exact` требует отдельного, более высокого. Оба калибруются на
+        # размеченной выборке.
+        self.exact_threshold = float(
+            os.getenv("EXACT_THRESHOLD", str(max(0.8, self.lexical_score_threshold)))
+        )
+        if self.exact_threshold < self.lexical_score_threshold:
+            logger.warning(
+                "EXACT_THRESHOLD=%.2f ниже LEXICAL_SCORE_THRESHOLD=%.2f: "
+                "тир exact снова вырождается в «любой лексический хит»",
+                self.exact_threshold,
+                self.lexical_score_threshold,
+            )
+
+        # Индексировать ли проверяемую работу в корпус. Прежде индексация была
+        # безусловной: любая пробная проверка навсегда попадала в пул сравнения.
+        self.index_by_default = os.getenv(
+            "INDEX_ANALYZED_DOCUMENTS", "1"
+        ).strip().lower() not in {"0", "false", "no"}
+
+        # Пересоздание коллекции удаляет ВСЕ проиндексированные работы. Смена
+        # EMBEDDING_MODEL в env не должна молча стирать корпус, поэтому по
+        # умолчанию сервис падает с внятной ошибкой и требует явного согласия.
+        self.allow_collection_recreate = os.getenv(
+            "ALLOW_COLLECTION_RECREATE", "0"
+        ).strip().lower() in {"1", "true", "yes"}
 
         # Отсечение служебных разделов (титульник, содержание, список источников,
         # приложения) до нарезки на чанки. Отключается глобально через env либо
@@ -208,11 +242,25 @@ class AntiPlagiarismWorker:
                     sparse_cfg = info.config.params.sparse_vectors or {}
                     has_lexical = self.LEXICAL_VECTOR in sparse_cfg
                     if current_size == vector_size and has_lexical:
+                        self._ensure_payload_indexes()
                         return
-                    print(
-                        f"Qdrant collection schema mismatch "
-                        f"(dense: {current_size} -> {vector_size}, lexical: {has_lexical}); "
-                        f"recreating collection."
+                    if not self.allow_collection_recreate:
+                        raise RuntimeError(
+                            f"Схема коллекции {self.collection_name!r} несовместима "
+                            f"(dense: {current_size} -> {vector_size}, "
+                            f"lexical: {has_lexical}). Пересоздание УДАЛИТ все "
+                            f"проиндексированные работы — их придётся загружать "
+                            f"заново. Если это действительно нужно, запустите с "
+                            f"ALLOW_COLLECTION_RECREATE=1; иначе верните прежний "
+                            f"EMBEDDING_MODEL."
+                        )
+                    logger.warning(
+                        "Схема коллекции несовместима (dense: %s -> %s, lexical: %s); "
+                        "ALLOW_COLLECTION_RECREATE=1 — пересоздаю, все работы в "
+                        "коллекции будут удалены",
+                        current_size,
+                        vector_size,
+                        has_lexical,
                     )
                     self.qdrant.delete_collection(self.collection_name)
 
@@ -225,7 +273,12 @@ class AntiPlagiarismWorker:
                     },
                     sparse_vectors_config={self.LEXICAL_VECTOR: SparseVectorParams()},
                 )
+                self._ensure_payload_indexes()
                 return
+            except RuntimeError:
+                # Отказ пересоздавать коллекцию — не транзиентный сбой, повтор
+                # не поможет и лишь отложит внятную ошибку на 30 секунд.
+                raise
             except Exception as e:  # includes connection errors / Qdrant not ready yet
                 last_err = e
                 time.sleep(1)
@@ -233,36 +286,38 @@ class AntiPlagiarismWorker:
         if last_err:
             raise RuntimeError(f"Qdrant is not ready: {last_err}") from last_err
 
-    def extract_real_text(self, text_input: str) -> str:
-        if not isinstance(text_input, str) or not text_input.startswith("FILE_BASE64|"):
-            return text_input
-        try:
-            parts = text_input.split("|", 2)
-            if len(parts) != 3:
-                return text_input
-            _, ext, b64_data = parts
-            file_bytes = base64.b64decode(b64_data)
-            file_stream = io.BytesIO(file_bytes)
-            if ext.lower() == "pdf":
-                from pypdf import PdfReader
+    def _ensure_payload_indexes(self) -> None:
+        """
+        Индексы по полям payload, по которым строится фильтр сравнения.
 
-                reader = PdfReader(file_stream)
-                extracted = "\n".join(
-                    [page.extract_text() or "" for page in reader.pages]
+        Без них must/must_not в каждом из 2xN запросов на документ приводит к
+        полному перебору точек коллекции: на десятках тысяч работ это становится
+        узким местом раньше, чем инференс модели.
+        """
+        fields = {
+            "document_id": PayloadSchemaType.INTEGER,
+            "filename": PayloadSchemaType.KEYWORD,
+            "category": PayloadSchemaType.KEYWORD,
+            "institution_id": PayloadSchemaType.KEYWORD,
+            "user_id": PayloadSchemaType.KEYWORD,
+        }
+        for field_name, schema in fields.items():
+            try:
+                self.qdrant.create_payload_index(
+                    collection_name=self.collection_name,
+                    field_name=field_name,
+                    field_schema=schema,
                 )
-                return extracted.strip()
-            elif ext.lower() in ["docx", "doc"]:
-                import docx
+            except Exception as exc:  # noqa: BLE001 — индекс уже есть либо гонка
+                logger.debug("Индекс payload %s: %s", field_name, exc)
 
-                doc = docx.Document(file_stream)
-                extracted = "\n".join([p.text for p in doc.paragraphs])
-                return extracted.strip()
-        except Exception as e:
-            # Пробрасываем ошибку (api_server отдаст 400): раньше здесь
-            # возвращалась строка-заглушка, которая индексировалась как текст
-            # документа — и все последующие битые файлы «совпадали» с ней на 100%.
-            raise ValueError(f"Не удалось извлечь текст из файла: {e}") from e
-        return text_input
+    def extract_real_text(self, text_input: str) -> str:
+        """Текст работы из `FILE_BASE64|ext|...` либо строка как есть.
+
+        Разбор и лимиты размера — в document_text; при превышении или битом
+        файле поднимается ValueError, api_server отдаёт на него 400."""
+        text, _was_file = extract_document_text(text_input)
+        return text
 
     def _lexical_sparse(self, text: str) -> Optional[SparseVector]:
         """
@@ -362,53 +417,15 @@ class AntiPlagiarismWorker:
         user_id: Optional[str] = None,
         exclude_document_ids: Optional[List[int]] = None,
     ) -> Filter:
-        """
-        Сравниваем только с чужими работами того же вуза/типа.
-        Исключаем: текущий документ, все документы того же user_id,
-        и явный список exclude_document_ids (для старых точек без user_id в payload).
-        """
-        must_not: List[FieldCondition] = []
-        if document_id is not None:
-            must_not.append(
-                FieldCondition(key="document_id", match=MatchValue(value=document_id))
-            )
-        else:
-            must_not.append(
-                FieldCondition(key="filename", match=MatchValue(value=filename))
-            )
-
-        uid = (user_id or "").strip()
-        if uid:
-            must_not.append(
-                FieldCondition(key="user_id", match=MatchValue(value=uid))
-            )
-
-        extra_ids = [
-            int(x)
-            for x in (exclude_document_ids or [])
-            if isinstance(x, (int, float)) and int(x) > 0 and int(x) != document_id
-        ]
-        # Unique, capped — Qdrant MatchAny on huge lists is costly
-        extra_ids = sorted(set(extra_ids))[:500]
-        if extra_ids:
-            must_not.append(
-                FieldCondition(key="document_id", match=MatchAny(any=extra_ids))
-            )
-
-        must: List[FieldCondition] = []
-        inst = (institution_id or "").strip()
-        if inst:
-            must.append(
-                FieldCondition(key="institution_id", match=MatchValue(value=inst))
-            )
-
-        pool = comparison_categories(category)
-        if len(pool) == 1:
-            must.append(FieldCondition(key="category", match=MatchValue(value=pool[0])))
-        else:
-            must.append(FieldCondition(key="category", match=MatchAny(any=pool)))
-
-        return Filter(must=must, must_not=must_not)
+        """Пул сравнения — правила в comparison_scope (синхронны с guard-main)."""
+        return build_comparison_filter(
+            document_id,
+            filename,
+            category,
+            institution_id,
+            user_id=user_id,
+            exclude_document_ids=exclude_document_ids,
+        )
 
     def process_text(
         self,
@@ -421,6 +438,7 @@ class AntiPlagiarismWorker:
         user_id: Optional[str] = None,
         exclude_document_ids: Optional[List[int]] = None,
         strip_sections: Optional[bool] = None,
+        index_document: Optional[bool] = None,
     ) -> Dict:
         # Сериализуем доступ к общей ML-модели и клиенту Qdrant (см. self._process_lock).
         with self._process_lock:
@@ -434,6 +452,7 @@ class AntiPlagiarismWorker:
                 user_id,
                 exclude_document_ids,
                 strip_sections,
+                index_document,
             )
 
     def _process_text_locked(
@@ -447,6 +466,7 @@ class AntiPlagiarismWorker:
         user_id: Optional[str] = None,
         exclude_document_ids: Optional[List[int]] = None,
         strip_sections: Optional[bool] = None,
+        index_document: Optional[bool] = None,
     ) -> Dict:
         norm_category = normalize_category_slug(category or "uncategorized")
         norm_institution = (institution_id or "").strip() or None
@@ -467,7 +487,7 @@ class AntiPlagiarismWorker:
             analyzed_text, report = strip_service_sections(actual_text)
             sections_report = report.as_dict()
             if verbose and report.removed:
-                print(f"Удалены служебные разделы: {', '.join(report.removed)}")
+                logger.info("Удалены служебные разделы: %s", ", ".join(report.removed))
 
         chunks = self.text_splitter.split_text(analyzed_text)
         if not chunks:
@@ -479,7 +499,7 @@ class AntiPlagiarismWorker:
                 "sections": sections_report,
             }
         if verbose:
-            print(f"Analysis {filename[:20]}... (chunks: {len(chunks)})")
+            logger.info("Анализ %s... (чанков: %d)", filename[:20], len(chunks))
         ai_texts = [chunk for chunk in chunks if len(chunk.strip()) > 100]
         ai_stats = [d for d in self._analyze_ai_chunks(ai_texts) if d is not None]
         if ai_stats:
@@ -534,7 +554,7 @@ class AntiPlagiarismWorker:
                         query=sparse,
                         using=self.LEXICAL_VECTOR,
                         limit=1,
-                        score_threshold=self.lexical_score_threshold,
+                        score_threshold=self.lexical_score_threshold,  # поиск; exact — по self.exact_threshold
                         with_payload=True,
                         filter=search_filter,
                     )
@@ -594,6 +614,7 @@ class AntiPlagiarismWorker:
                         "max_lexical_score": 0.0,
                         "paraphrase_score": 0.0,
                         "sample": "",
+                        "_best_score": 0.0,
                     },
                 )
                 if src_key not in counted_sources:
@@ -602,8 +623,12 @@ class AntiPlagiarismWorker:
                 score = float(top.score or 0.0)
                 if score > agg[score_field]:
                     agg[score_field] = round(score, 4)
-                    if kind == "semantic" or not agg["sample"]:
-                        agg["sample"] = chunk_text[:300]
+                # Пример берём из самого сильного совпадения по ЛЮБОМУ сигналу,
+                # иначе у источника с сильным лексическим хитом в отчёт попадал
+                # текст слабого семантического.
+                if score > agg["_best_score"]:
+                    agg["_best_score"] = score
+                    agg["sample"] = chunk_text[:300]
                 # Сигнал «перефраз» для каскада: пересечение смысловых 3-грамм
                 # проверяемого чанка и текста найденного чанка-источника.
                 matched_text = payload.get("text")
@@ -628,7 +653,10 @@ class AntiPlagiarismWorker:
                     },
                 )
             )
-        if points_to_insert:
+        do_index = (
+            self.index_by_default if index_document is None else bool(index_document)
+        )
+        if points_to_insert and do_index:
             # Переиндексация без дубликатов: старые чанки этого документа
             # удаляются, иначе каждый повторный анализ раздувает коллекцию.
             # Удаляем только по document_id — по filename опасно (несколько
@@ -644,19 +672,25 @@ class AntiPlagiarismWorker:
                 collection_name=self.collection_name, points=points_to_insert
             )
         plagiarism_percent = round((plagiarized_chunks / len(chunks)) * 100, 2)
+        # Сила совпадения вперёд числа чанков: источник с одним дословно
+        # скопированным фрагментом важнее источника с тремя слабыми.
         semantic_matches: List[dict] = sorted(
             matches_by_source.values(),
-            key=lambda m: (m["matched_chunks"], max(m["max_score"], m["max_lexical_score"])),
+            key=lambda m: (
+                max(m["max_score"], m["max_lexical_score"]),
+                m["matched_chunks"],
+            ),
             reverse=True,
         )
         # Каскадная классификация источников (единственный источник истины):
         # exact → paraphrase → semantic, см. cascade.py.
         by_type = {"exact": 0, "paraphrase": 0, "semantic": 0}
         for match in semantic_matches:
+            match.pop("_best_score", None)
             match["match_type"] = classify_match(
                 match["max_lexical_score"],
                 match["paraphrase_score"],
-                self.lexical_score_threshold,
+                self.exact_threshold,
                 self.paraphrase_threshold,
             )
             by_type[match["match_type"]] += 1

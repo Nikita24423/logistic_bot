@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import secrets
 from contextlib import asynccontextmanager
 from typing import Any, Optional
 
@@ -14,6 +15,26 @@ from university_queues import DEFAULT_UNIVERSITY, UniversityQueues
 from worker import AntiPlagiarismWorker
 
 logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Длина работы в символах. Без лимита один большой документ (или base64 PDF)
+# исчерпывает память процесса, в котором анализ сериализован локом.
+MAX_CONTENT_CHARS = int(os.getenv("ANALYSIS_MAX_CONTENT_CHARS", str(40 * 1024 * 1024)))
+
+# Пауза перед повторной загрузкой моделей, если инициализация провалилась.
+WORKER_RETRY_DELAY_SEC = int(os.getenv("ANALYSIS_WORKER_RETRY_SEC", "60"))
+
+# Сильные ссылки на фоновые таски: event loop держит лишь слабую ссылку, и
+# задача без собственной ссылки может быть собрана сборщиком мусора до
+# завершения — джоба тогда навсегда осталась бы в статусе queued.
+_background_tasks: set[asyncio.Task] = set()
+
+
+def _spawn(coro) -> asyncio.Task:
+    task = asyncio.create_task(coro)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+    return task
 
 _worker: Optional[AntiPlagiarismWorker] = None
 _worker_error: Optional[str] = None
@@ -24,7 +45,7 @@ _queues = UniversityQueues(concurrency=int(os.getenv("ANALYSIS_CONCURRENCY", "1"
 
 
 class AnalyzeRequest(BaseModel):
-    content: str = Field(..., min_length=1)
+    content: str = Field(..., min_length=1, max_length=MAX_CONTENT_CHARS)
     filename: str = Field(default="document.txt", max_length=512)
     document_id: Optional[int] = None
     university_id: str = Field(default=DEFAULT_UNIVERSITY, max_length=128)
@@ -36,6 +57,10 @@ class AnalyzeRequest(BaseModel):
     # Отсечение служебных разделов (титульник, содержание, список источников,
     # приложения) до анализа. None — взять значение из env STRIP_SERVICE_SECTIONS.
     strip_sections: Optional[bool] = None
+    # Индексировать ли работу в корпус сравнения. None — значение из env
+    # INDEX_ANALYZED_DOCUMENTS. false — «пробная» проверка, которая не попадёт
+    # в пул сравнения последующих работ.
+    index_document: Optional[bool] = None
 
 
 class SemanticMatch(BaseModel):
@@ -90,15 +115,27 @@ class JobStatusResponse(BaseModel):
 def _verify_api_key(x_api_key: Optional[str]) -> None:
     expected = os.getenv("ANALYSIS_API_KEY", "").strip()
     if not expected:
+        # Аутентификация выключена: сервис принимает работы и ПИШЕТ в корпус
+        # от кого угодно, кто может достучаться до порта.
         return
-    if not x_api_key or x_api_key.strip() != expected:
+    provided = (x_api_key or "").strip()
+    # compare_digest вместо !=: обычное сравнение строк выходит на первом
+    # различии и по времени ответа подсказывает подбирающему длину совпавшего
+    # префикса.
+    if not provided or not secrets.compare_digest(provided, expected):
         raise HTTPException(status_code=401, detail="Invalid API key")
 
 
 def _require_worker() -> AntiPlagiarismWorker:
     if _worker is None:
         if _worker_error:
-            raise HTTPException(status_code=503, detail=f"Worker failed to start: {_worker_error}")
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    f"Worker failed to start: {_worker_error}. "
+                    f"Retrying every {WORKER_RETRY_DELAY_SEC}s."
+                ),
+            )
         raise HTTPException(
             status_code=503,
             detail="Worker is still loading models. Wait and retry (first start can take 5–15 minutes on CPU).",
@@ -117,13 +154,27 @@ def _to_analyze_response(result: dict[str, Any]) -> AnalyzeResponse:
 
 
 async def _init_worker() -> None:
+    """Загружает модели, повторяя попытки: самая частая причина провала —
+    Qdrant, который поднимается дольше, чем ждёт клиент, и проходит сама."""
+    attempt = 0
+    while _worker is None:
+        attempt += 1
+        await _init_worker_once(attempt)
+        if _worker is None:
+            await asyncio.sleep(WORKER_RETRY_DELAY_SEC)
+
+
+async def _init_worker_once(attempt: int) -> None:
     global _worker, _worker_error, _worker_loading
     _worker_loading = True
     try:
         qdrant_host = os.getenv("QDRANT_HOST", "localhost")
         qdrant_port = int(os.getenv("QDRANT_PORT", "6333"))
         qdrant_collection = os.getenv("QDRANT_COLLECTION", "university_docs")
-        logging.info("Loading ML models (first start may take several minutes on CPU)...")
+        logger.info(
+            "Загрузка ML-моделей, попытка %d (первый старт на CPU — несколько минут)...",
+            attempt,
+        )
         _worker = await run_in_threadpool(
             lambda: AntiPlagiarismWorker(
                 qdrant_host=qdrant_host,
@@ -131,17 +182,37 @@ async def _init_worker() -> None:
                 collection_name=qdrant_collection,
             )
         )
-        logging.info("ML worker is ready")
+        logger.info("ML-воркер готов")
+        _worker_error = None
     except Exception as exc:
         _worker_error = str(exc)
-        logging.exception("Failed to initialize ML worker")
+        logger.exception(
+            "Попытка %d инициализации ML-воркера не удалась; повтор через %d с",
+            attempt,
+            WORKER_RETRY_DELAY_SEC,
+        )
     finally:
         _worker_loading = False
 
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    task = asyncio.create_task(_init_worker())
+    if not os.getenv("ANALYSIS_API_KEY", "").strip():
+        logger.warning(
+            "ANALYSIS_API_KEY не задан: эндпоинты анализа открыты без "
+            "аутентификации, и любой, кто достучится до порта, может писать "
+            "в корпус сравнения. Задайте ключ в .env для production."
+        )
+    store = get_job_store()
+    if not store.persistent:
+        logger.warning(
+            "Журнал джоб ведётся в памяти: после рестарта все job_id исчезнут "
+            "и клиент получит 404 на валидный идентификатор."
+        )
+    # Джобы, прерванные прошлым рестартом, уже никто не выполнит.
+    await store.recover_interrupted()
+
+    task = _spawn(_init_worker())
     _queues.start()
     yield
     await _queues.stop()
@@ -197,6 +268,7 @@ async def analyze(body: AnalyzeRequest, x_api_key: Optional[str] = Header(defaul
                 user_id=body.user_id,
                 exclude_document_ids=body.exclude_document_ids,
                 strip_sections=body.strip_sections,
+                index_document=body.index_document,
             ),
         )
     except ValueError as exc:
@@ -223,6 +295,7 @@ async def submit_job(body: AnalyzeRequest, x_api_key: Optional[str] = Header(def
     user_id = body.user_id
     exclude_document_ids = list(body.exclude_document_ids or [])
     strip_sections = body.strip_sections
+    index_document = body.index_document
     job_id = rec.job_id
 
     def _submit():
@@ -238,10 +311,11 @@ async def submit_job(body: AnalyzeRequest, x_api_key: Optional[str] = Header(def
                 user_id=user_id,
                 exclude_document_ids=exclude_document_ids,
                 strip_sections=strip_sections,
+                index_document=index_document,
             ),
         )
 
-    asyncio.create_task(run_queued_job(job_id, _submit))
+    _spawn(run_queued_job(job_id, _submit))
 
     return JobSubmitResponse(job_id=job_id, status="queued")
 
@@ -251,7 +325,10 @@ async def get_job(job_id: str, x_api_key: Optional[str] = Header(default=None, a
     _verify_api_key(x_api_key)
     rec = await get_job_store().get(job_id)
     if rec is None:
-        raise HTTPException(status_code=404, detail="Job not found")
+        raise HTTPException(
+            status_code=404,
+            detail="Job not found: unknown id, or the job expired and was purged",
+        )
 
     result = None
     if rec.status == "completed" and rec.result is not None:
@@ -276,5 +353,5 @@ async def queues(x_api_key: Optional[str] = Header(default=None, alias="X-API-Ke
     _verify_api_key(x_api_key)
     return {
         "queues": _queues.stats(),
-        "jobs": get_job_store().stats(),
+        "jobs": await get_job_store().stats(),
     }
