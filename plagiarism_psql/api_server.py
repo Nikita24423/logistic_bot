@@ -5,6 +5,9 @@ from contextlib import asynccontextmanager
 from typing import Any, Optional
 
 from fastapi import FastAPI, Header, HTTPException
+from fastapi.responses import JSONResponse
+
+from errors import AnalysisError, AnalysisErrorCode
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
@@ -68,6 +71,7 @@ class JobStatusResponse(BaseModel):
     status: str
     result: Optional[AnalyzeResponse] = None
     error: Optional[str] = None
+    error_code: Optional[str] = None
     document_id: Optional[int] = None
     filename: Optional[str] = None
 
@@ -182,6 +186,9 @@ async def analyze(body: AnalyzeRequest, x_api_key: Optional[str] = Header(defaul
                 exclude_document_ids=body.exclude_document_ids,
             ),
         )
+    except AnalysisError as exc:
+        # Краткая причина + код (задача 4), а не общий текст ошибки.
+        raise HTTPException(status_code=exc.http_status, detail=exc.as_response())
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     return _to_analyze_response(result)
@@ -246,6 +253,7 @@ async def get_job(job_id: str, x_api_key: Optional[str] = Header(default=None, a
         status=rec.status,
         result=result,
         error=rec.error,
+        error_code=getattr(rec, "error_code", None),
         document_id=rec.document_id,
         filename=rec.filename,
     )

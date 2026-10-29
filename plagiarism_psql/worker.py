@@ -60,6 +60,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 # (единственный источник истины по типам exact/paraphrase/semantic).
 from ai_scoring import ai_percent_from_scores, format_startup_line, load_ai_config, score_stats
 from comparison_scope import comparison_categories, normalize_category_slug
+from errors import AnalysisError, AnalysisErrorCode
 from cascade import (
     DEFAULT_PARAPHRASE_THRESHOLD,
     STOPWORDS as _STOPWORDS,
@@ -234,35 +235,63 @@ class AntiPlagiarismWorker:
             raise RuntimeError(f"Qdrant is not ready: {last_err}") from last_err
 
     def extract_real_text(self, text_input: str) -> str:
+        """
+        Текст работы из `FILE_BASE64|ext|...` либо строка как есть.
+
+        На каждую категорию сбоя поднимается AnalysisError со своим кодом
+        (задача 4: пользователю возвращается краткая причина, а не общий текст).
+        Заглушку вместо текста не возвращаем: раньше она индексировалась как
+        текст документа, и все битые файлы «совпадали» с ней на 100%.
+        """
         if not isinstance(text_input, str) or not text_input.startswith("FILE_BASE64|"):
             return text_input
+        parts = text_input.split("|", 2)
+        if len(parts) != 3:
+            raise AnalysisError(
+                AnalysisErrorCode.CORRUPT_FILE,
+                detail="FILE_BASE64 payload has fewer than 3 parts",
+            )
+        _, ext, b64_data = parts
+        ext = ext.lower().strip()
+
+        if ext not in ("pdf", "docx", "doc"):
+            raise AnalysisError(
+                AnalysisErrorCode.UNSUPPORTED_FORMAT,
+                detail=f"unsupported extension {ext!r}",
+            )
+
         try:
-            parts = text_input.split("|", 2)
-            if len(parts) != 3:
-                return text_input
-            _, ext, b64_data = parts
             file_bytes = base64.b64decode(b64_data)
-            file_stream = io.BytesIO(file_bytes)
-            if ext.lower() == "pdf":
+        except Exception as e:  # noqa: BLE001 — битый base64
+            raise AnalysisError(
+                AnalysisErrorCode.CORRUPT_FILE, detail=f"base64 decode failed: {e}"
+            ) from e
+
+        file_stream = io.BytesIO(file_bytes)
+        try:
+            if ext == "pdf":
                 from pypdf import PdfReader
 
                 reader = PdfReader(file_stream)
                 extracted = "\n".join(
                     [page.extract_text() or "" for page in reader.pages]
-                )
-                return extracted.strip()
-            elif ext.lower() in ["docx", "doc"]:
+                ).strip()
+            else:  # docx / doc
                 import docx
 
                 doc = docx.Document(file_stream)
-                extracted = "\n".join([p.text for p in doc.paragraphs])
-                return extracted.strip()
-        except Exception as e:
-            # Пробрасываем ошибку (api_server отдаст 400): раньше здесь
-            # возвращалась строка-заглушка, которая индексировалась как текст
-            # документа — и все последующие битые файлы «совпадали» с ней на 100%.
-            raise ValueError(f"Не удалось извлечь текст из файла: {e}") from e
-        return text_input
+                extracted = "\n".join([p.text for p in doc.paragraphs]).strip()
+        except Exception as e:  # noqa: BLE001 — повреждённый или нечитаемый файл
+            raise AnalysisError(
+                AnalysisErrorCode.EXTRACTION_FAILED, detail=f"{ext} parse failed: {e}"
+            ) from e
+
+        if not extracted:
+            raise AnalysisError(
+                AnalysisErrorCode.NO_TEXT,
+                detail=f"no extractable text in {ext} file",
+            )
+        return extracted
 
     def _lexical_sparse(self, text: str) -> Optional[SparseVector]:
         """
@@ -485,12 +514,8 @@ class AntiPlagiarismWorker:
         actual_text = self.extract_real_text(text)
         chunks = self.text_splitter.split_text(actual_text)
         if not chunks:
-            return {
-                "plagiarism_percent": 0.0,
-                "ai_percent": 0.0,
-                "parsed_text": actual_text,
-                "semantic_matches": [],
-            }
+            # Нет текста для проверки (пустой документ, одни пробелы).
+            raise AnalysisError(AnalysisErrorCode.NO_TEXT, detail="no chunks after split")
         if verbose:
             print(f"Analysis {filename[:20]}... (chunks: {len(chunks)})")
         ai_windows = self.ai_splitter.split_text(actual_text) if self.ai_config.enabled else []

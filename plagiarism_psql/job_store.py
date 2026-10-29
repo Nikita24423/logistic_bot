@@ -14,6 +14,8 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
+from errors import AnalysisError, AnalysisErrorCode
+
 logger = logging.getLogger(__name__)
 
 JOB_TTL_SEC = int(__import__("os").getenv("ANALYSIS_JOB_TTL_SEC", str(48 * 3600)))
@@ -29,6 +31,7 @@ class JobRecord:
     completed_at: Optional[float] = None
     result: Optional[dict[str, Any]] = None
     error: Optional[str] = None
+    error_code: Optional[str] = None
     document_id: Optional[int] = None
     filename: str = "document.txt"
 
@@ -73,13 +76,14 @@ class JobStore:
             rec.completed_at = time.time()
             rec.error = None
 
-    async def mark_failed(self, job_id: str, error: str) -> None:
+    async def mark_failed(self, job_id: str, error: str, error_code: Optional[str] = None) -> None:
         async with self._lock:
             rec = self._jobs.get(job_id)
             if not rec:
                 return
             rec.status = "failed"
             rec.error = (error or "unknown error")[:2000]
+            rec.error_code = error_code
             rec.completed_at = time.time()
 
     async def _purge_expired(self) -> None:
@@ -121,6 +125,14 @@ async def run_queued_job(
         future = submit()
         result = await future
         await store.mark_completed(job_id, result if isinstance(result, dict) else {})
-    except Exception as exc:  # noqa: BLE001
+    except AnalysisError as exc:
+        # Известная причина: краткое сообщение + код (задача 4).
+        logger.info("Analysis job %s failed: %s (%s)", job_id, exc.code, exc.detail)
+        await store.mark_failed(job_id, exc.message, error_code=exc.code)
+    except Exception as exc:  # noqa: BLE001 — непредвиденный сбой
         logger.exception("Async analysis job %s failed", job_id)
-        await store.mark_failed(job_id, str(exc))
+        await store.mark_failed(
+            job_id,
+            "Во время проверки произошла ошибка обработки.",
+            error_code=AnalysisErrorCode.INTERNAL_ERROR,
+        )
