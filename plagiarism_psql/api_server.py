@@ -66,9 +66,19 @@ class SemanticMatch(BaseModel):
     fragments: list[MatchFragment] = []
 
 
+class AiFragment(BaseModel):
+    """По-чанковая оценка ИИ для локализации (задача 9)."""
+    text: str = ""
+    d_score: float = 0.0
+    ai_probability: float = 0.0
+
+
 class AnalyzeResponse(BaseModel):
     plagiarism_percent: float
-    ai_percent: float
+    # null = сигнала нет (детектор выключен или нет анализируемого текста),
+    # это НЕ то же самое, что 0% («точно человек»).
+    ai_percent: Optional[float] = None
+    ai_fragments: list[AiFragment] = []
     semantic_matches: list[SemanticMatch] = []
     by_type: dict[str, int] = {}
 
@@ -108,9 +118,11 @@ def _require_worker() -> AntiPlagiarismWorker:
 
 
 def _to_analyze_response(result: dict[str, Any]) -> AnalyzeResponse:
+    raw_ai = result.get("ai_percent")
     return AnalyzeResponse(
         plagiarism_percent=float(result.get("plagiarism_percent", 0.0)),
-        ai_percent=float(result.get("ai_percent", 0.0)),
+        ai_percent=None if raw_ai is None else float(raw_ai),
+        ai_fragments=[AiFragment(**f) for f in result.get("ai_fragments", [])],
         semantic_matches=[SemanticMatch(**m) for m in result.get("semantic_matches", [])],
         by_type=result.get("by_type", {}),
     )

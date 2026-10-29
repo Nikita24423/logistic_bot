@@ -58,7 +58,13 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 # Стоп-слова и каскадная классификация заимствований — в cascade.py
 # (единственный источник истины по типам exact/paraphrase/semantic).
-from ai_scoring import ai_percent_from_scores, format_startup_line, load_ai_config, score_stats
+from ai_scoring import (
+    ai_percent_from_scores,
+    format_startup_line,
+    load_ai_config,
+    score_stats,
+    sigmoid_ai_percent,
+)
 from comparison_scope import comparison_categories, normalize_category_slug
 from errors import AnalysisError, AnalysisErrorCode
 from text_normalize import normalize_text
@@ -542,7 +548,24 @@ class AntiPlagiarismWorker:
                 if score is not None:
                     ai_pairs.append((chunk, score))
         ai_stats = [score for _, score in ai_pairs]
-        ai_percent = ai_percent_from_scores(ai_stats, self.ai_config) if self.ai_config.enabled else 0.0
+        # null, а не 0: «детектор выключен» и «нет анализируемого текста» — это
+        # отсутствие сигнала, а не «точно человек» (задача 9).
+        if not self.ai_config.enabled or not ai_stats:
+            ai_percent = None
+        else:
+            ai_percent = ai_percent_from_scores(ai_stats, self.ai_config)
+        # Локализация: по-чанковые оценки, чтобы было видно, КАКИЕ фрагменты
+        # выглядят как ИИ, а не только одно число по документу (задача 9).
+        ai_fragments = [
+            {
+                "text": chunk[:300],
+                "d_score": round(score, 4),
+                "ai_probability": sigmoid_ai_percent(
+                    score, self.ai_config.d0, self.ai_config.scale
+                ),
+            }
+            for chunk, score in ai_pairs[: self.report_max_fragments]
+        ]
         self._log_ai(document_id, filename, len(ai_windows), ai_pairs, ai_percent)
         vectors = self.encoder.encode(
             chunks, batch_size=16, show_progress_bar=False, normalize_embeddings=True
@@ -750,6 +773,7 @@ class AntiPlagiarismWorker:
         return {
             "plagiarism_percent": plagiarism_percent,
             "ai_percent": ai_percent,
+            "ai_fragments": ai_fragments,
             "parsed_text": actual_text,
             "semantic_matches": semantic_matches,
             "by_type": by_type,
