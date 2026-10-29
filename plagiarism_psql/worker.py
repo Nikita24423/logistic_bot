@@ -61,6 +61,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from ai_scoring import ai_percent_from_scores, format_startup_line, load_ai_config, score_stats
 from comparison_scope import comparison_categories, normalize_category_slug
 from errors import AnalysisError, AnalysisErrorCode
+from text_normalize import normalize_text
 from cascade import (
     DEFAULT_PARAPHRASE_THRESHOLD,
     STOPWORDS as _STOPWORDS,
@@ -127,6 +128,15 @@ class AntiPlagiarismWorker:
         # поэтому скор лежит в [0..1]: 1.0 — дословная копия чанка, ~0.8 — лёгкая
         # правка, <0.3 — несвязанные тексты. Калибруется через env.
         self.lexical_score_threshold = float(os.getenv("LEXICAL_SCORE_THRESHOLD", "0.60"))
+
+        # Максимум фрагментов на источник в полном отчёте (задача 1): ограничивает
+        # размер ответа на работах с массой совпадений.
+        self.report_max_fragments = _parse_positive_int("REPORT_MAX_FRAGMENTS_PER_SOURCE", 50)
+
+        # Сколько работ-источников искать на каждый чанк. Раньше было 1 — и если
+        # один фрагмент скомпилирован из нескольких работ, атрибутировался лишь
+        # один источник. Теперь до REPORT_SOURCES_PER_CHUNK источников на чанк.
+        self.report_top_k = _parse_positive_int("REPORT_SOURCES_PER_CHUNK", 5)
 
         # Порог Жаккара 3-грамм смысловых слов для тира «перефраз» каскада.
         self.paraphrase_threshold = float(
@@ -511,7 +521,9 @@ class AntiPlagiarismWorker:
         norm_category = normalize_category_slug(category or "uncategorized")
         norm_institution = (institution_id or "").strip() or None
         norm_user_id = (user_id or "").strip() or None
-        actual_text = self.extract_real_text(text)
+        # Нормализация до нарезки (задача 10): тривиальные различия форматов
+        # одной работы не должны менять границы чанков и показатели.
+        actual_text = normalize_text(self.extract_real_text(text))
         chunks = self.text_splitter.split_text(actual_text)
         if not chunks:
             # Нет текста для проверки (пустой документ, одни пробелы).
@@ -563,7 +575,7 @@ class AntiPlagiarismWorker:
                 QueryRequest(
                     query=vec,
                     using=self.DENSE_VECTOR,
-                    limit=1,
+                    limit=self.report_top_k,
                     score_threshold=self.qdrant_score_threshold,
                     with_payload=True,
                     filter=search_filter,
@@ -576,7 +588,7 @@ class AntiPlagiarismWorker:
                     QueryRequest(
                         query=sparse,
                         using=self.LEXICAL_VECTOR,
-                        limit=1,
+                        limit=self.report_top_k,
                         score_threshold=self.lexical_score_threshold,
                         with_payload=True,
                         filter=search_filter,
@@ -596,11 +608,11 @@ class AntiPlagiarismWorker:
                 )
             else:
                 raise
-        # Топ-совпадение каждого чанка по каждому сигналу.
-        chunk_hits: List[Dict[str, object]] = [{} for _ in chunks]
+        # Все совпадения каждого чанка по каждому сигналу (до report_top_k).
+        chunk_hits: List[Dict[str, list]] = [{} for _ in chunks]
         for (chunk_idx, kind), qdrant_res in zip(request_map, batch_search_results):
-            if len(qdrant_res.points) > 0:
-                chunk_hits[chunk_idx][kind] = qdrant_res.points[0]
+            if qdrant_res.points:
+                chunk_hits[chunk_idx][kind] = list(qdrant_res.points)
         plagiarized_chunks = 0
         points_to_insert = []
         # Аггрегация совпадений по работам-источникам: dense ловит глубокий рерайт
@@ -611,49 +623,80 @@ class AntiPlagiarismWorker:
             zip(chunks, vectors, sparse_vectors)
         ):
             hits = chunk_hits[chunk_idx]
-            if hits:
+            if any(hits.values()):
                 plagiarized_chunks += 1
-            counted_sources = set()
-            for kind, score_field in (
-                ("semantic", "max_score"),
-                ("lexical", "max_lexical_score"),
-            ):
-                top = hits.get(kind)
-                if top is None:
-                    continue
-                payload = top.payload or {}
-                src_key = str(
-                    payload.get("document_id")
-                    if payload.get("document_id") is not None
-                    else payload.get("filename") or "unknown"
-                )
+            # Сгруппировать все совпадения этого чанка по источнику: один чанк
+            # может совпасть с НЕСКОЛЬКИМИ работами, и по обоим сигналам.
+            per_source: Dict[str, dict] = {}
+            for kind in ("semantic", "lexical"):
+                for top in hits.get(kind, []):
+                    payload = top.payload or {}
+                    src_key = str(
+                        payload.get("document_id")
+                        if payload.get("document_id") is not None
+                        else payload.get("filename") or "unknown"
+                    )
+                    entry = per_source.setdefault(
+                        src_key,
+                        {
+                            "document_id": payload.get("document_id"),
+                            "filename": payload.get("filename"),
+                            "semantic_score": 0.0,
+                            "lexical_score": 0.0,
+                            "source_text": "",
+                        },
+                    )
+                    score = float(top.score or 0.0)
+                    if kind == "semantic":
+                        entry["semantic_score"] = max(entry["semantic_score"], score)
+                    else:
+                        entry["lexical_score"] = max(entry["lexical_score"], score)
+                    matched_text = payload.get("text")
+                    if isinstance(matched_text, str) and matched_text and not entry["source_text"]:
+                        entry["source_text"] = matched_text
+
+            # Записать фрагмент-совпадение в каждый задетый источник (задача 1:
+            # какой фрагмент работы с каким фрагментом источника совпал).
+            for src_key, entry in per_source.items():
                 agg = matches_by_source.setdefault(
                     src_key,
                     {
-                        "document_id": payload.get("document_id"),
-                        "filename": payload.get("filename"),
+                        "document_id": entry["document_id"],
+                        "filename": entry["filename"],
                         "matched_chunks": 0,
                         "max_score": 0.0,
                         "max_lexical_score": 0.0,
                         "paraphrase_score": 0.0,
                         "sample": "",
+                        "fragments": [],
+                        "_best_score": 0.0,
                     },
                 )
-                if src_key not in counted_sources:
-                    agg["matched_chunks"] += 1
-                    counted_sources.add(src_key)
-                score = float(top.score or 0.0)
-                if score > agg[score_field]:
-                    agg[score_field] = round(score, 4)
-                    if kind == "semantic" or not agg["sample"]:
-                        agg["sample"] = chunk_text[:300]
-                # Сигнал «перефраз» для каскада: пересечение смысловых 3-грамм
-                # проверяемого чанка и текста найденного чанка-источника.
-                matched_text = payload.get("text")
-                if isinstance(matched_text, str) and matched_text:
-                    p_score = paraphrase_similarity(chunk_text, matched_text)
-                    if p_score > agg["paraphrase_score"]:
-                        agg["paraphrase_score"] = round(p_score, 4)
+                agg["matched_chunks"] += 1  # один инкремент на пару чанк-источник
+                sem = round(entry["semantic_score"], 4)
+                lex = round(entry["lexical_score"], 4)
+                par = round(paraphrase_similarity(chunk_text, entry["source_text"]), 4) \
+                    if entry["source_text"] else 0.0
+                agg["max_score"] = max(agg["max_score"], sem)
+                agg["max_lexical_score"] = max(agg["max_lexical_score"], lex)
+                agg["paraphrase_score"] = max(agg["paraphrase_score"], par)
+                frag_type = classify_match(
+                    lex, par, self.lexical_score_threshold, self.paraphrase_threshold
+                )
+                if len(agg["fragments"]) < self.report_max_fragments:
+                    agg["fragments"].append({
+                        "work_text": chunk_text[:500],
+                        "source_text": (entry["source_text"] or "")[:500],
+                        "match_type": frag_type,
+                        "semantic_score": sem,
+                        "lexical_score": lex,
+                        "paraphrase_score": par,
+                    })
+                # Пример источника — самый сильный фрагмент по любому сигналу.
+                best = max(sem, lex)
+                if best > agg["_best_score"]:
+                    agg["_best_score"] = best
+                    agg["sample"] = chunk_text[:300]
             point_vector: Dict[str, object] = {self.DENSE_VECTOR: vector}
             if sparse is not None:
                 point_vector[self.LEXICAL_VECTOR] = sparse
@@ -696,6 +739,7 @@ class AntiPlagiarismWorker:
         # exact → paraphrase → semantic, см. cascade.py.
         by_type = {"exact": 0, "paraphrase": 0, "semantic": 0}
         for match in semantic_matches:
+            match.pop("_best_score", None)
             match["match_type"] = classify_match(
                 match["max_lexical_score"],
                 match["paraphrase_score"],

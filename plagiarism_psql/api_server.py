@@ -38,6 +38,17 @@ class AnalyzeRequest(BaseModel):
     exclude_document_ids: list[int] = Field(default_factory=list)
 
 
+class MatchFragment(BaseModel):
+    """Один совпавший фрагмент (задача 1): какой кусок работы с каким куском
+    источника совпал, тип и скоры."""
+    work_text: str = ""        # фрагмент проверяемой работы
+    source_text: str = ""      # фрагмент работы-источника
+    match_type: str = "semantic"
+    semantic_score: float = 0.0
+    lexical_score: float = 0.0
+    paraphrase_score: float = 0.0
+
+
 class SemanticMatch(BaseModel):
     """Совпадение с работой-источником: семантическое (глубокий рерайт, max_score)
     и/или лексическое (дословное копирование, max_lexical_score).
@@ -52,6 +63,7 @@ class SemanticMatch(BaseModel):
     paraphrase_score: float = 0.0
     match_type: str = "semantic"
     sample: str = ""
+    fragments: list[MatchFragment] = []
 
 
 class AnalyzeResponse(BaseModel):
